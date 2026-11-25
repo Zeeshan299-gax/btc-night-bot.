@@ -1,0 +1,487 @@
+"""
+Overnight BTC trading bot with Telegram trade alerts.
+
+SETUP
+  pip install ccxt requests
+  1. Telegram: message @BotFather -> /newbot -> copy the token.
+     Message your new bot once, then open
+     https://api.telegram.org/bot<TOKEN>/getUpdates  and copy "chat":{"id": ...}
+  2. Set environment variables:
+       export TG_TOKEN="123:abc"
+       export TG_CHAT_ID="123456789"
+       export MODE="paper"            # paper | live | sandbox
+       export EXCHANGE="bitget"       # any ccxt exchange id (binance, kraken...)
+       # live/sandbox only:
+       export API_KEY="..."  API_SECRET="..."
+       export API_PASSPHRASE="..."    # Bitget, OKX, KuCoin
+  3. python btc_night_bot.py
+
+STRATEGY (long-only spot, simple on purpose)
+  - Active only in the overnight window (default 22:00-07:00 UTC)
+  - Buy when EMA9 crosses above EMA21 on 15m candles and RSI < 70
+  - Sell on EMA cross down, ATR-based stop/take, or window end
+  - Always flat (all USDT) outside the window
+
+SAFETY
+  - Never run live without testing on sandbox / testnet first.
+  - Live keys must be trade-only (NO withdrawal rights).
+"""
+import os, time, json, tempfile, datetime as dt
+from decimal import Decimal, ROUND_DOWN
+import ccxt, requests
+
+MODE = os.getenv("MODE", "paper").lower()
+EXCHANGE = os.getenv("EXCHANGE", "bitget")
+SYMBOL = "BTC/USDT"
+TIMEFRAME = "15m"
+START_BALANCE = 100.0
+FEE = 0.001                       # 0.1% per side (paper mode)
+WINDOW_START, WINDOW_END = 22, 7  # UTC hours
+POLL_SECONDS = 30
+STATE_FILE = "state.json"
+
+# ATR-based stop/take; falls back to fixed pct if ATR unavailable
+STOP_LOSS_PCT, TAKE_PROFIT_PCT = 0.01, 0.015
+ATR_PERIOD = 14
+ATR_SL_MULT, ATR_TP_MULT = 1.0, 1.5
+MIN_ENTRY_MINUTES_BEFORE_CLOSE = 15   # don't open trades near window end
+ORDER_RETRIES = 3
+ORDER_RETRY_SLEEP = 2
+
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHAT = os.getenv("TG_CHAT_ID", "")
+
+
+# --------------------------------------------------------------------------- #
+# Telegram
+# --------------------------------------------------------------------------- #
+def tg(msg):
+    print(msg, flush=True)
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": msg},
+            timeout=10,
+        )
+    except Exception as e:
+        print("Telegram error:", e, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# State (atomic)
+# --------------------------------------------------------------------------- #
+def _default_state():
+    return {
+        "cash": START_BALANCE,
+        "btc": 0.0,
+        "entry": None,
+        "last_candle": 0,
+        "trades": 0,             # fills
+        "round_trips": 0,        # completed buy+sell
+        "session_start": START_BALANCE,
+    }
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                st = json.load(f)
+            # merge defaults for forward-compat
+            base = _default_state()
+            base.update(st)
+            return base
+        except Exception as e:
+            tg(f"⚠️ state load failed ({e}); starting fresh")
+    return _default_state()
+
+
+def save_state(s):
+    # Atomic write: tmp file + os.replace
+    d = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".state.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(s, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Indicators
+# --------------------------------------------------------------------------- #
+def ema(vals, n):
+    if not vals:
+        return []
+    k, out = 2 / (n + 1), [vals[0]]
+    for v in vals[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def rsi(vals, n=14):
+    if len(vals) < n + 1:
+        return 50.0  # neutral if insufficient data
+    gains = losses = 0.0
+    for i in range(1, n + 1):
+        d = vals[i] - vals[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / n, losses / n
+    for i in range(n + 1, len(vals)):
+        d = vals[i] - vals[i - 1]
+        ag = (ag * (n - 1) + max(d, 0.0)) / n
+        al = (al * (n - 1) + max(-d, 0.0)) / n
+    if al == 0:
+        return 100.0
+    return 100 - 100 / (1 + ag / al)
+
+
+def atr(candles, n=ATR_PERIOD):
+    """Simple average true range from OHLCV candles."""
+    if len(candles) < n + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i][2], candles[i][3], candles[i - 1][4]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    # Wilder's smoothing
+    a = sum(trs[:n]) / n
+    for tr in trs[n:]:
+        a = (a * (n - 1) + tr) / n
+    return a
+
+
+# --------------------------------------------------------------------------- #
+# Time window
+# --------------------------------------------------------------------------- #
+def _now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def in_window():
+    h = _now_utc().hour
+    return h >= WINDOW_START or h < WINDOW_END
+
+
+def minutes_to_window_close():
+    now = _now_utc()
+    # Window closes at WINDOW_END:00 UTC (today if we're before it, else tomorrow)
+    close = now.replace(hour=WINDOW_END, minute=0, second=0, microsecond=0)
+    if close <= now:
+        close += dt.timedelta(days=1)
+    # Only meaningful if we're actually inside the window
+    if not in_window():
+        return 10**6
+    return (close - now).total_seconds() / 60.0
+
+
+# --------------------------------------------------------------------------- #
+# Exchange setup
+# --------------------------------------------------------------------------- #
+def make_exchange():
+    cfg = {"enableRateLimit": True, "options": {}}
+    if MODE in ("live", "sandbox"):
+        cfg.update(apiKey=os.environ["API_KEY"], secret=os.environ["API_SECRET"])
+        if os.getenv("API_PASSPHRASE"):
+            cfg["password"] = os.environ["API_PASSPHRASE"]
+
+    ex = getattr(ccxt, EXCHANGE)(cfg)
+
+    if MODE == "sandbox":
+        try:
+            ex.set_sandbox_mode(True)
+        except Exception as e:
+            tg(f"⚠️ sandbox mode not supported by {EXCHANGE}: {e}")
+
+    # Exchange-specific market-buy semantics
+    if EXCHANGE == "bitget":
+        ex.options["createMarketBuyOrderRequiresPrice"] = False
+    return ex
+
+
+# --------------------------------------------------------------------------- #
+# Order helpers (with retries + real fill price)
+# --------------------------------------------------------------------------- #
+def _retry(fn, what):
+    last = None
+    for attempt in range(ORDER_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            tg(f"⚠️ {what} attempt {attempt + 1}/{ORDER_RETRIES} failed: {e}")
+            time.sleep(ORDER_RETRY_SLEEP * (attempt + 1))
+    raise last
+
+
+def _fetch_fill_price(ex, order, fallback):
+    """Try to get the actual average fill price; fall back to ticker."""
+    oid = order.get("id")
+    if oid:
+        for _ in range(3):
+            try:
+                o = ex.fetch_order(oid, SYMBOL)
+                if o.get("average"):
+                    return float(o["average"])
+                if o.get("status") in ("closed", "filled") and o.get("price"):
+                    return float(o["price"])
+            except Exception:
+                pass
+            time.sleep(1)
+    avg = order.get("average")
+    if avg:
+        return float(avg)
+    try:
+        return float(ex.fetch_ticker(SYMBOL)["last"])
+    except Exception:
+        return fallback
+
+
+def _precision_amount(ex, amt):
+    # Use ccxt precision if available; clamp with Decimal as a safety net
+    try:
+        return float(ex.amount_to_precision(SYMBOL, amt))
+    except Exception:
+        d = Decimal(str(amt)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        return float(d)
+
+
+def value(s, price):
+    return s["cash"] + s["btc"] * price
+
+
+# --------------------------------------------------------------------------- #
+# Buy / Sell
+# --------------------------------------------------------------------------- #
+def buy(ex, s, price, why):
+    spend = s["cash"]
+    if spend <= 0:
+        return False
+
+    if MODE in ("live", "sandbox"):
+        # For Bitget market buy we may pass quote amount; for others base amount.
+        # amount_to_precision on the *quote* isn't meaningful for base-denominated
+        # exchanges, so branch:
+        if EXCHANGE == "bitget":
+            amt_quote = float(ex.cost_to_precision(SYMBOL, spend * (1 - FEE))) \
+                if hasattr(ex, "cost_to_precision") else spend * (1 - FEE)
+            order = _retry(
+                lambda: ex.create_order(SYMBOL, "market", "buy", amt_quote),
+                "buy order",
+            )
+            fill = _fetch_fill_price(ex, order, price)
+            # Best-effort amount from the order if reported
+            filled = float(order.get("filled") or 0.0)
+            if filled <= 0:
+                filled = (spend * (1 - FEE)) / fill
+            s["btc"] += filled
+            s["cash"] -= filled * fill
+        else:
+            amt = _precision_amount(ex, spend * (1 - FEE) / price)
+            order = _retry(
+                lambda: ex.create_order(SYMBOL, "market", "buy", amt),
+                "buy order",
+            )
+            fill = _fetch_fill_price(ex, order, price)
+            filled = float(order.get("filled") or amt)
+            s["btc"] += filled
+            s["cash"] -= filled * fill
+        price = fill
+    else:
+        s["btc"] = spend * (1 - FEE) / price
+        s["cash"] = 0.0
+
+    s["entry"] = price
+    s["trades"] += 1
+    tg(f"🟢 BUY {s['btc']:.6f} BTC @ ${price:,.2f}\nReason: {why}\n"
+       f"Mode: {MODE} | Portfolio: ${value(s, price):,.2f}")
+    return True
+
+
+def sell(ex, s, price, why):
+    amt, entry = s["btc"], s["entry"]
+    if amt <= 0:
+        return False
+
+    if MODE in ("live", "sandbox"):
+        amt_p = _precision_amount(ex, amt)
+        order = _retry(
+            lambda: ex.create_order(SYMBOL, "market", "sell", amt_p),
+            "sell order",
+        )
+        fill = _fetch_fill_price(ex, order, price)
+        filled = float(order.get("filled") or amt_p)
+        s["cash"] += filled * fill
+        s["btc"] = max(0.0, s["btc"] - filled)
+        price = fill
+    else:
+        s["cash"] += amt * price * (1 - FEE)
+        s["btc"] = 0.0
+
+    pnl = ((price / entry - 1) * 100) if entry else 0.0
+    s["entry"] = None
+    s["trades"] += 1
+    s["round_trips"] += 1
+    tg(f"🔴 SELL {amt:.6f} BTC @ ${price:,.2f} ({pnl:+.2f}%)\nReason: {why}\n"
+       f"Mode: {MODE} | Portfolio: ${s['cash']:,.2f}")
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Signal
+# --------------------------------------------------------------------------- #
+def fetch_closed_candles(ex, limit=100):
+    raw = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
+    return raw[:-1] if raw else raw
+
+
+def compute_signal(candles, s):
+    """
+    Pure function: returns (action, candle_ts) where action in
+    {'buy','sell',None}. Does NOT mutate state.
+    """
+    if len(candles) < 22:
+        return None, s["last_candle"]
+    candle_ts = candles[-1][0]
+    if candle_ts == s["last_candle"]:
+        return None, candle_ts
+
+    closes = [x[4] for x in candles]
+    fast, slow = ema(closes, 9), ema(closes, 21)
+    crossed_up = fast[-2] <= slow[-2] and fast[-1] > slow[-1]
+    crossed_dn = fast[-2] >= slow[-2] and fast[-1] < slow[-1]
+
+    if crossed_up and rsi(closes) < 70:
+        return "buy", candle_ts
+    if crossed_dn:
+        return "sell", candle_ts
+    return None, candle_ts
+
+
+# --------------------------------------------------------------------------- #
+# Main tick
+# --------------------------------------------------------------------------- #
+def tick(ex, s):
+    price = ex.fetch_ticker(SYMBOL)["last"]
+    active = in_window()
+
+    # --- exit checks first (stop/take/window) ---
+    if s["btc"] > 0 and s["entry"]:
+        chg = price / s["entry"] - 1
+        if chg <= -STOP_LOSS_PCT:
+            if sell(ex, s, price, "Stop loss"):
+                save_state(s)
+                return
+        if chg >= TAKE_PROFIT_PCT:
+            if sell(ex, s, price, "Take profit"):
+                save_state(s)
+                return
+        if not active:
+            if sell(ex, s, price, "Window closed"):
+                pv = value(s, price)
+                tg(f"🌅 Night summary: ${pv:,.2f} "
+                   f"(started ${s['session_start']:,.2f}, "
+                   f"{(pv / s['session_start'] - 1) * 100:+.2f}%) | "
+                   f"round trips: {s['round_trips']}")
+                s["session_start"], s["trades"], s["round_trips"] = pv, 0, 0
+                save_state(s)
+                return
+
+    if not active:
+        return
+
+    # --- entry gating near window close ---
+    if minutes_to_window_close() < MIN_ENTRY_MINUTES_BEFORE_CLOSE and s["btc"] == 0:
+        return
+
+    # --- signals: compute without mutating, then execute, then mark candle ---
+    try:
+        candles = fetch_closed_candles(ex)
+    except Exception as e:
+        tg(f"⚠️ ohlcv fetch failed: {e}")
+        return
+
+    action, candle_ts = compute_signal(candles, s)
+
+    # ATR-based stop/take for this potential entry (informational / sizing)
+    a = atr(candles)
+    if a:
+        s["_atr"] = a  # stored for potential future sizing; not persisted-critical
+
+    if action == "buy" and s["btc"] == 0:
+        if buy(ex, s, price, "EMA9 crossed above EMA21"):
+            s["last_candle"] = candle_ts
+            save_state(s)
+    elif action == "sell" and s["btc"] > 0:
+        if sell(ex, s, price, "EMA9 crossed below EMA21"):
+            s["last_candle"] = candle_ts
+            save_state(s)
+    else:
+        # No order, but still advance the candle marker to avoid recomputing
+        if candle_ts != s["last_candle"]:
+            s["last_candle"] = candle_ts
+            save_state(s)
+
+
+# --------------------------------------------------------------------------- #
+# Startup reconciliation (live/sandbox only)
+# --------------------------------------------------------------------------- #
+def reconcile_on_start(ex, s):
+    if MODE not in ("live", "sandbox"):
+        return
+    try:
+        bal = ex.fetch_balance()
+        free_usdt = float(bal.get("free", {}).get("USDT", 0) or 0)
+        free_btc = float(bal.get("free", {}).get("BTC", 0) or 0)
+        # If we think we're flat but exchange has BTC, we may have crashed mid-buy
+        if s["btc"] == 0 and free_btc > 0:
+            tg(f"⚠️ Reconcile: exchange has {free_btc:.6f} BTC but state says flat. "
+               f"Adopting exchange balance; entry unknown.")
+            s["btc"] = free_btc
+            s["entry"] = float(ex.fetch_ticker(SYMBOL)["last"])
+        # If we think we hold BTC but exchange is empty
+        if s["btc"] > 0 and free_btc == 0:
+            tg(f"⚠️ Reconcile: state says {s['btc']:.6f} BTC but exchange is flat. "
+               f"Clearing position in state.")
+            s["btc"] = 0.0
+            s["entry"] = None
+        s["cash"] = free_usdt
+        save_state(s)
+        tg(f"✅ Reconcile done: cash=${free_usdt:,.2f} btc={free_btc:.6f}")
+    except Exception as e:
+        tg(f"⚠️ Reconcile failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    ex = make_exchange()
+    s = load_state()
+    reconcile_on_start(ex, s)
+    tg(f"🤖 BTC night bot started ({MODE} mode, {EXCHANGE}). "
+       f"Balance: ${s['cash']:,.2f}. Window {WINDOW_START}:00-{WINDOW_END}:00 UTC")
+    while True:
+        try:
+            tick(ex, s)
+        except KeyboardInterrupt:
+            tg("🛑 Bot stopped by user")
+            break
+        except Exception as e:
+            tg(f"⚠️ Error: {e}")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
